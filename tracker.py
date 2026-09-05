@@ -20,8 +20,8 @@ def setup_google_sheets():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SHEETS_JSON, scopes=scopes
+    creds = Credentials.from_service_account_info(
+        creds_dict, scopes=scopes
     )
     client = gspread.authorize(creds)
     spreadsheet = client.open(SPREADSHEET_NAME)
