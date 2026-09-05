@@ -5,14 +5,19 @@ import os
 import json
 import gspread
 import requests
+import statistics
 from google.oauth2.service_account import Credentials
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-# --- CONFIGURAZIONE ---
+# --- CONFIGURAZIONE GITHUB SECRETS ---
 CARDTRADER_TOKEN = os.environ.get("CARDTRADER_TOKEN") 
 creds_dict = json.loads(os.environ.get("GCP_CREDENTIALS"))
 SPREADSHEET_NAME = "Pokemon_Tracker"
 BASE_URL = "https://api.cardtrader.com/api/v2"
-CT_HEADERS = {"Authorization": f"Bearer {CARDTRADER_TOKEN}"}
+
+# --- COSTANTI ALGORITMO ---
+CONDITIONS_HIERARCHY = ["Mint", "Near Mint", "Slightly Played", "Moderately Played", "Played", "Poor"]
+MAX_PRICE_CAP = 200.00
 
 
 def setup_google_sheets():
@@ -36,86 +41,136 @@ def setup_google_sheets():
     )
 
 
-def analyze_order_book(blueprint_id, language, target_conditions=None):
+def parse_bool(value):
+    """Converte 'SI', 'TRUE', '1' in booleano True, altrimenti False."""
+    if isinstance(value, bool): return value
+    if not value: return False
+    return str(value).strip().upper() in ("SI", "SÌ", "TRUE", "1", "YES", "Y")
+
+
+@retry(
+    retry=retry_if_exception_type(requests.exceptions.RequestException),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(5)
+)
+def fetch_api(endpoint, params, session):
+    """Chiamata API con Exponential Backoff per evitare ban 429."""
+    response = session.get(endpoint, params=params, timeout=10)
+    if response.status_code == 429:
+        raise requests.exceptions.RequestException("Rate Limit Hit (429)")
+    if response.status_code == 200:
+        return response.json()
+    return {}
+
+
+def analyze_order_book(blueprint_id, language, is_reverse, is_first_ed, session, max_cap=MAX_PRICE_CAP):
+    """Core Algorithm: Hard Filters -> Condition Degradation -> Vendor Trade-Off."""
     endpoint = f"{BASE_URL}/marketplace/products"
     params = {"blueprint_id": blueprint_id, "language": language}
     
     try:
-        response = requests.get(endpoint, headers=CT_HEADERS, params=params, timeout=10)
+        response_data = fetch_api(endpoint, params, session)
+        raw_products = response_data.get(str(blueprint_id), [])
         
-        if response.status_code == 200:
-            raw_products = response.json().get(str(blueprint_id), [])
+        if not raw_products:
+            return None
             
-            # Filtro base: non in vacanza e con quantità > 0
-            valid_products = [
-                p for p in raw_products 
-                if not p.get("on_vacation", False) and p.get("quantity", 0) > 0
-            ]
+        # 1. HARD FILTERS (Vacanza, Cancellazioni, Quantità, Flag Speciali)
+        valid_products = []
+        for p in raw_products:
+            user = p.get("user", {})
+            props = p.get("properties_hash", {})
             
-            # Filtro condizioni (Near Mint / Mint) per i target di osservazione
-            if target_conditions:
-                valid_products = [
-                    p for p in valid_products
-                    if p.get("properties_hash", {}).get("condition") in target_conditions
-                ]
+            if p.get("on_vacation", False) or p.get("quantity", 0) <= 0:
+                continue
+            if user.get("too_many_request_for_cancel_as_seller", False):
+                continue
+                
+            item_reverse = bool(props.get("reverse_holo", False))
+            item_first = bool(props.get("first_edition", False))
+            
+            if item_reverse != is_reverse or item_first != is_first_ed:
+                continue
+                
+            valid_products.append(p)
+            
+        if not valid_products:
+            return None
 
-            if not valid_products:
-                return None
-            
-            valid_products.sort(key=lambda x: x.get("price", {}).get("cents", 0))
-            
-            # Filtro outlier (prendiamo solo carte che costano fino al triplo della più economica)
-            first_price = valid_products[0].get("price", {}).get("cents", 0) / 100.0
-            filtered_products = [
+        # 2. DEGRADAZIONE CONDIZIONE & BUDGET CAP
+        selected_condition = None
+        target_cond_listings = []
+        
+        for cond in CONDITIONS_HIERARCHY:
+            cond_listings = [
                 p for p in valid_products 
-                if (p.get("price", {}).get("cents", 0) / 100.0) <= (first_price * 3.0)
+                if p.get("properties_hash", {}).get("condition", "") == cond
             ]
             
-            if not filtered_products:
-                return None
+            if not cond_listings:
+                continue
+                
+            min_price_in_cond = min([p.get("price", {}).get("cents", 0) / 100.0 for p in cond_listings])
+            
+            if min_price_in_cond <= max_cap:
+                selected_condition = cond
+                target_cond_listings = cond_listings
+                break
+                
+        if not selected_condition:
+            return None # Nessuna offerta disponibile sotto i 200 euro per tutte le condizioni
+            
+        # 3. VENDOR TRADE-OFF (Gruppo A vs Gruppo B)
+        group_a = []
+        group_b = []
+        
+        for p in target_cond_listings:
+            user = p.get("user", {})
+            if user.get("country_code", "").upper() == "IT" or user.get("can_sell_via_hub", False):
+                group_a.append(p)
+            else:
+                group_b.append(p)
+                
+        # Sceglie il prezzo più basso nel Gruppo A, fallback sul Gruppo B
+        winner = min(group_a, key=lambda x: x.get("price", {}).get("cents", 0)) if group_a else min(group_b, key=lambda x: x.get("price", {}).get("cents", 0))
+        
+        winner_price = winner.get("price", {}).get("cents", 0) / 100.0
+        winner_user = winner.get("user", {})
+        
+        # 4. CALCOLO VWAP E VOLATILITÀ (Sulla condizione selezionata)
+        prices_eur = [p.get("price", {}).get("cents", 0) / 100.0 for p in target_cond_listings]
+        quantities = [p.get("quantity", 1) for p in target_cond_listings]
+        
+        market_depth = sum(quantities)
+        vwap = sum(p * q for p, q in zip(prices_eur, quantities)) / float(market_depth) if market_depth > 0 else winner_price
+        
+        if len(prices_eur) > 1:
+            mean = sum(prices_eur) / len(prices_eur)
+            variance = sum((x - mean) ** 2 for x in prices_eur) / len(prices_eur)
+            volatility = math.sqrt(variance)
+        else:
+            volatility = 0.0
 
-            prices_eur = [p.get("price", {}).get("cents", 0) / 100.0 for p in filtered_products]
-            quantities = [p.get("quantity", 1) for p in filtered_products]
-            
-            lowest_price = prices_eur[0]
-            lowest_seller = filtered_products[0].get("user", {}).get("username", "N/A")
-            market_depth = sum(quantities)
-            
-            # Calcolo VWAP sui primi 5 venditori
-            top_5_prices = prices_eur[:5]
-            top_5_qtys = quantities[:5]
-            total_top_qty = sum(top_5_qtys)
-            vwap = sum(p * q for p, q in zip(top_5_prices, top_5_qtys)) / float(total_top_qty) if total_top_qty > 0 else lowest_price
-            
-            # Calcolo Volatilità sui primi 10 venditori
-            top_10_prices = prices_eur[:10]
-            mean_top_10 = sum(top_10_prices) / len(top_10_prices)
-            variance = sum((x - mean_top_10) ** 2 for x in top_10_prices) / len(top_10_prices)
-            floor_volatility = math.sqrt(variance)
-            
-            return {
-                "lowest_price": round(lowest_price, 2),
-                "vwap": round(vwap, 2),
-                "volatility": round(floor_volatility, 2),
-                "depth": market_depth,
-                "lowest_seller": lowest_seller
-            }
-            
-        elif response.status_code == 429:
-            time.sleep(2)
-            return analyze_order_book(blueprint_id, language, target_conditions)
-            
-        return None
+        return {
+            "Condizione": selected_condition,
+            "Minimo": round(winner_price, 2),
+            "VWAP": round(vwap, 2),
+            "Volatilità": round(volatility, 2),
+            "Depth": market_depth,
+            "Paese": winner_user.get("country_code", "N/A").upper(),
+            "Tipo": "PRO" if winner_user.get("user_type") == "pro" else "Normal",
+            "Venditore": winner_user.get("username", "N/A"),
+            "CT Zero": "SI" if winner_user.get("can_sell_via_hub", False) else "NO"
+        }
         
     except Exception as e:
-        print(f"Errore API: {e}")
+        print(f"Errore API su {blueprint_id}: {e}")
         return None
 
 
-def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now):
+def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now, session):
     print("\n--- INIZIO ANALISI PORTFOLIO ---")
     rows = ws_portfolio.get_all_values()
-    
     rows_to_append = []
 
     for i, row in enumerate(rows[1:], start=2):
@@ -126,133 +181,129 @@ def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now):
         owned_language = row[2].strip().lower() or "it"
         blueprint_id = row[3].strip()
 
-        if not blueprint_id:
-            continue
+        if not blueprint_id: continue
 
         print(f"🔎 Portfolio: {nome_prodotto} (ID: {blueprint_id})...")
-        metrics_it = analyze_order_book(blueprint_id, "it")
-        time.sleep(1.2)
-        metrics_en = analyze_order_book(blueprint_id, "en")
-        time.sleep(1.2)
+        
+        # Portfolio assume falsi per default su reverse e 1st edition a meno che non ci siano colonne
+        metrics_it = analyze_order_book(blueprint_id, "it", False, False, session)
+        metrics_en = analyze_order_book(blueprint_id, "en", False, False, session)
 
         metrics_owned = metrics_it if owned_language == "it" else metrics_en
-
         if metrics_owned:
-            # Aggiorna Prezzo Spot e Ultimo Aggiornamento nel foglio Portfolio
-            ws_portfolio.update_cell(i, 8, metrics_owned["vwap"])
+            ws_portfolio.update_cell(i, 8, metrics_owned["VWAP"])
             ws_portfolio.update_cell(i, 12, timestamp_now)
 
-        val_it = metrics_it or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A"}
-        val_en = metrics_en or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A"}
+        null_res = {"Minimo": "N/A", "VWAP": "N/A", "Volatilità": "N/A", "Depth": "N/A"}
+        val_it = metrics_it or null_res
+        val_en = metrics_en or null_res
         
-        spread = round(metrics_en["vwap"] - metrics_it["vwap"], 2) if metrics_en and metrics_it else "N/A"
+        spread = round(metrics_en["VWAP"] - metrics_it["VWAP"], 2) if metrics_en and metrics_it else "N/A"
         
         rows_to_append.append([
             date_only, nome_prodotto, blueprint_id, 
-            val_it["lowest_price"], val_it["vwap"], val_it["volatility"], val_it["depth"],
-            val_en["lowest_price"], val_en["vwap"], val_en["volatility"], val_en["depth"], 
+            val_it["Minimo"], val_it["VWAP"], val_it["Volatilità"], val_it["Depth"],
+            val_en["Minimo"], val_en["VWAP"], val_en["Volatilità"], val_en["Depth"], 
             spread, owned_language
         ])
 
     if rows_to_append:
-        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
-        ws_storico.append_rows(rows_to_append)
+        rows_to_append.append([]) 
+        ws_storico.append_rows(rows_to_append, value_input_option='USER_ENTERED')
         print("✅ Storico Portfolio aggiornato con successo.")
 
 
-def process_osservazione_it_en(ws_target, ws_log, date_only):
-    print("\n--- OSSERVAZIONE (ITA/ENG - NM/MINT) ---")
+def process_osservazione_it_en(ws_target, ws_log, date_only, session):
+    print("\n--- OSSERVAZIONE (ITA/ENG) ---")
     rows = ws_target.get_all_values()
-    condizioni_top = ["Near Mint", "Mint"]
     rows_to_append = []
 
     for row in rows[1:]:
-        if len(row) < 2:
-            continue
+        if len(row) < 4:
+            row.extend([""] * (4 - len(row)))
+            
+        nome_prodotto, blueprint_id = row[0], row[1].strip()
+        is_reverse = parse_bool(row[2])
+        is_first_ed = parse_bool(row[3])
 
-        nome_prodotto = row[0]
-        blueprint_id = row[1].strip()
-
-        if not blueprint_id:
-            continue
+        if not blueprint_id: continue
 
         print(f"🎯 Target ITA/ENG: {nome_prodotto} (ID: {blueprint_id})...")
-        
-        metrics_it = analyze_order_book(blueprint_id, "it", target_conditions=condizioni_top)
-        time.sleep(1.2)
-        metrics_en = analyze_order_book(blueprint_id, "en", target_conditions=condizioni_top)
-        time.sleep(1.2)
+        metrics_it = analyze_order_book(blueprint_id, "it", is_reverse, is_first_ed, session)
+        metrics_en = analyze_order_book(blueprint_id, "en", is_reverse, is_first_ed, session)
 
-        val_it = metrics_it or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
-        val_en = metrics_en or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
+        null_res = {k: "N/A" for k in ["Condizione", "Minimo", "VWAP", "Volatilità", "Depth", "Paese", "Tipo", "Venditore", "CT Zero"]}
+        v_it = metrics_it or null_res
+        v_en = metrics_en or null_res
 
-        spread = round(metrics_en["vwap"] - metrics_it["vwap"], 2) if metrics_it and metrics_en else "N/A"
+        spread = round(metrics_en["Minimo"] - metrics_it["Minimo"], 2) if metrics_it and metrics_en else "N/A"
 
         rows_to_append.append([
             date_only, nome_prodotto, blueprint_id,
-            val_it["lowest_price"], val_it["vwap"], val_it["volatility"], val_it["depth"], val_it["lowest_seller"],
-            val_en["lowest_price"], val_en["vwap"], val_en["volatility"], val_en["depth"], val_en["lowest_seller"],
+            v_it["Condizione"], v_it["Minimo"], v_it["VWAP"], v_it["Volatilità"], v_it["Depth"], v_it["Paese"], v_it["Tipo"], v_it["Venditore"], v_it["CT Zero"],
+            v_en["Condizione"], v_en["Minimo"], v_en["VWAP"], v_en["Volatilità"], v_en["Depth"], v_en["Paese"], v_en["Tipo"], v_en["Venditore"], v_en["CT Zero"],
             spread
         ])
 
     if rows_to_append:
-        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
-        ws_log.append_rows(rows_to_append)
+        rows_to_append.append([]) 
+        ws_log.append_rows(rows_to_append, value_input_option='USER_ENTERED')
         print("✅ Storico Osservazione ITA/ENG aggiornato.")
 
 
-def process_osservazione_asiatica(ws_target, ws_log, date_only, language_code, section_name):
-    print(f"\n--- OSSERVAZIONE ({section_name} - NM/MINT) ---")
+def process_osservazione_asiatica(ws_target, ws_log, date_only, language_code, section_name, session):
+    print(f"\n--- OSSERVAZIONE ({section_name}) ---")
     rows = ws_target.get_all_values()
-    condizioni_top = ["Near Mint", "Mint"]
     rows_to_append = []
 
     for row in rows[1:]:
-        if len(row) < 2:
-            continue
+        if len(row) < 4:
+            row.extend([""] * (4 - len(row)))
 
-        nome_prodotto = row[0]
-        blueprint_id = row[1].strip()
+        nome_prodotto, blueprint_id = row[0], row[1].strip()
+        is_reverse = parse_bool(row[2])
+        is_first_ed = parse_bool(row[3])
 
-        if not blueprint_id:
-            continue
+        if not blueprint_id: continue
 
         print(f"🎯 Target {section_name}: {nome_prodotto} (ID: {blueprint_id})...")
-        
-        metrics = analyze_order_book(blueprint_id, language_code, target_conditions=condizioni_top)
-        time.sleep(1.2)
+        metrics = analyze_order_book(blueprint_id, language_code, is_reverse, is_first_ed, session)
 
-        val = metrics or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
+        null_res = {k: "N/A" for k in ["Condizione", "Minimo", "VWAP", "Volatilità", "Depth", "Paese", "Tipo", "Venditore", "CT Zero"]}
+        v = metrics or null_res
 
         rows_to_append.append([
             date_only, nome_prodotto, blueprint_id,
-            val["lowest_price"], val["vwap"], val["volatility"], val["depth"], val["lowest_seller"]
+            v["Condizione"], v["Minimo"], v["VWAP"], v["Volatilità"], v["Depth"], v["Paese"], v["Tipo"], v["Venditore"], v["CT Zero"]
         ])
 
     if rows_to_append:
-        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
-        ws_log.append_rows(rows_to_append)
+        rows_to_append.append([]) 
+        ws_log.append_rows(rows_to_append, value_input_option='USER_ENTERED')
         print(f"✅ Storico Osservazione {section_name} aggiornato.")
 
 
 def update_system():
-    # Setup connessione a Google Sheets
     sheets = setup_google_sheets()
+    
+    # Setup Requests Session (Connection Pooling)
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {CARDTRADER_TOKEN}"})
     
     timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     date_only = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. Processo Portfolio -> Aggiorna Portfolio e salva in Storico
-    process_portfolio(sheets[0], sheets[1], date_only, timestamp_now)
+    # 1. Processo Portfolio
+    process_portfolio(sheets[0], sheets[1], date_only, timestamp_now, session)
     
     # 2. Processo Osservazione ITA/ENG
-    process_osservazione_it_en(sheets[2], sheets[3], date_only)
+    process_osservazione_it_en(sheets[2], sheets[3], date_only, session)
     
     # 3. Processo Osservazione Giapponese (jp)
-    process_osservazione_asiatica(sheets[4], sheets[5], date_only, "jp", "JAP")
+    process_osservazione_asiatica(sheets[4], sheets[5], date_only, "jp", "JAP", session)
     
-    # 4. Processo Osservazione Cinese Semplificato (cn)
-    process_osservazione_asiatica(sheets[6], sheets[7], date_only, "cn", "CHI")
+    # 4. Processo Osservazione Cinese (cn) - "zh-cn" in base a standard CT, verifica se usa "cn" o "zh-cn"
+    process_osservazione_asiatica(sheets[6], sheets[7], date_only, "cn", "CHI", session)
 
     print("\n🚀 Elaborazione e storicizzazione globale completate con successo!")
 
