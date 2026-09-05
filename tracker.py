@@ -20,12 +20,20 @@ def setup_google_sheets():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(
-        creds_dict, scopes=scopes
-    )
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
     spreadsheet = client.open(SPREADSHEET_NAME)
-    return spreadsheet.worksheet("Portfolio"), spreadsheet.worksheet("Storico"), spreadsheet.worksheet("Carte in osservazione")
+    
+    return (
+        spreadsheet.worksheet("Portfolio"), 
+        spreadsheet.worksheet("Storico"), 
+        spreadsheet.worksheet("Target ITA/ENG"),
+        spreadsheet.worksheet("Carte in osservazione (ITA/ENG)"),
+        spreadsheet.worksheet("Target JAP"),
+        spreadsheet.worksheet("Carte in osservazione JAP"),
+        spreadsheet.worksheet("Target CHI"),
+        spreadsheet.worksheet("Carte in osservazione CHI")
+    )
 
 
 def analyze_order_book(blueprint_id, language, target_conditions=None):
@@ -38,13 +46,13 @@ def analyze_order_book(blueprint_id, language, target_conditions=None):
         if response.status_code == 200:
             raw_products = response.json().get(str(blueprint_id), [])
             
-            # 1. Filtriamo inserzioni attive
+            # Filtro base: non in vacanza e con quantità > 0
             valid_products = [
                 p for p in raw_products 
                 if not p.get("on_vacation", False) and p.get("quantity", 0) > 0
             ]
             
-            # 2. SEZIONE OSSERVAZIONE: Filtro opzionale per condizione (NM o Mint)
+            # Filtro condizioni (Near Mint / Mint) per i target di osservazione
             if target_conditions:
                 valid_products = [
                     p for p in valid_products
@@ -54,10 +62,9 @@ def analyze_order_book(blueprint_id, language, target_conditions=None):
             if not valid_products:
                 return None
             
-            # 3. Ordiniamo per prezzo
             valid_products.sort(key=lambda x: x.get("price", {}).get("cents", 0))
             
-            # 4. Scartiamo outlier
+            # Filtro outlier (prendiamo solo carte che costano fino al triplo della più economica)
             first_price = valid_products[0].get("price", {}).get("cents", 0) / 100.0
             filtered_products = [
                 p for p in valid_products 
@@ -71,16 +78,16 @@ def analyze_order_book(blueprint_id, language, target_conditions=None):
             quantities = [p.get("quantity", 1) for p in filtered_products]
             
             lowest_price = prices_eur[0]
-            # Estrazione del nome venditore che detiene il prezzo più basso
             lowest_seller = filtered_products[0].get("user", {}).get("username", "N/A")
             market_depth = sum(quantities)
             
+            # Calcolo VWAP sui primi 5 venditori
             top_5_prices = prices_eur[:5]
             top_5_qtys = quantities[:5]
             total_top_qty = sum(top_5_qtys)
-            
             vwap = sum(p * q for p, q in zip(top_5_prices, top_5_qtys)) / float(total_top_qty) if total_top_qty > 0 else lowest_price
             
+            # Calcolo Volatilità sui primi 10 venditori
             top_10_prices = prices_eur[:10]
             mean_top_10 = sum(top_10_prices) / len(top_10_prices)
             variance = sum((x - mean_top_10) ** 2 for x in top_10_prices) / len(top_10_prices)
@@ -109,6 +116,8 @@ def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now):
     print("\n--- INIZIO ANALISI PORTFOLIO ---")
     rows = ws_portfolio.get_all_values()
     
+    rows_to_append = []
+
     for i, row in enumerate(rows[1:], start=2):
         if len(row) < 12:
             row.extend([""] * (12 - len(row)))
@@ -121,7 +130,6 @@ def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now):
             continue
 
         print(f"🔎 Portfolio: {nome_prodotto} (ID: {blueprint_id})...")
-        # Per il portfolio non passiamo il target_conditions, calcola su tutto
         metrics_it = analyze_order_book(blueprint_id, "it")
         time.sleep(1.2)
         metrics_en = analyze_order_book(blueprint_id, "en")
@@ -130,87 +138,125 @@ def process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now):
         metrics_owned = metrics_it if owned_language == "it" else metrics_en
 
         if metrics_owned:
+            # Aggiorna Prezzo Spot e Ultimo Aggiornamento nel foglio Portfolio
             ws_portfolio.update_cell(i, 8, metrics_owned["vwap"])
             ws_portfolio.update_cell(i, 12, timestamp_now)
 
-        # Storicizzazione standard (Omissis stampe per brevità)
         val_it = metrics_it or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A"}
         val_en = metrics_en or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A"}
         
         spread = round(metrics_en["vwap"] - metrics_it["vwap"], 2) if metrics_en and metrics_it else "N/A"
         
-        ws_storico.append_row([
+        rows_to_append.append([
             date_only, nome_prodotto, blueprint_id, 
             val_it["lowest_price"], val_it["vwap"], val_it["volatility"], val_it["depth"],
             val_en["lowest_price"], val_en["vwap"], val_en["volatility"], val_en["depth"], 
             spread, owned_language
         ])
 
+    if rows_to_append:
+        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
+        ws_storico.append_rows(rows_to_append)
+        print("✅ Storico Portfolio aggiornato con successo.")
 
-def process_osservazione(ws_osservazione):
-    print("\n--- INIZIO ANALISI CARTE IN OSSERVAZIONE (SOLO NM/MINT) ---")
-    rows = ws_osservazione.get_all_values()
-    
-    # Condizioni target per l'osservazione speculativa
+
+def process_osservazione_it_en(ws_target, ws_log, date_only):
+    print("\n--- OSSERVAZIONE (ITA/ENG - NM/MINT) ---")
+    rows = ws_target.get_all_values()
     condizioni_top = ["Near Mint", "Mint"]
-    
-    # Aggiornamenti batch per ridurre chiamate API a Google Sheets
-    updates = []
+    rows_to_append = []
 
-    for i, row in enumerate(rows[1:], start=2):
-        if len(row) < 14:
-            row.extend([""] * (14 - len(row)))
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
 
         nome_prodotto = row[0]
-        blueprint_id = row[2].strip()
+        blueprint_id = row[1].strip()
 
         if not blueprint_id:
             continue
 
-        print(f"🎯 Osservazione: {nome_prodotto} (ID: {blueprint_id})...")
+        print(f"🎯 Target ITA/ENG: {nome_prodotto} (ID: {blueprint_id})...")
         
-        # Passiamo le condizioni target
         metrics_it = analyze_order_book(blueprint_id, "it", target_conditions=condizioni_top)
         time.sleep(1.2)
         metrics_en = analyze_order_book(blueprint_id, "en", target_conditions=condizioni_top)
         time.sleep(1.2)
 
-        # Preparazione dati IT
-        if metrics_it:
-            updates.append({"range": f"D{i}:H{i}", "values": [[
-                metrics_it["lowest_price"], metrics_it["vwap"], metrics_it["volatility"], 
-                metrics_it["depth"], metrics_it["lowest_seller"]
-            ]]})
-        
-        # Preparazione dati EN
-        if metrics_en:
-            updates.append({"range": f"I{i}:M{i}", "values": [[
-                metrics_en["lowest_price"], metrics_en["vwap"], metrics_en["volatility"], 
-                metrics_en["depth"], metrics_en["lowest_seller"]
-            ]]})
-            
-        # Calcolo Spread
-        if metrics_it and metrics_en:
-            spread = round(metrics_en["vwap"] - metrics_it["vwap"], 2)
-            updates.append({"range": f"N{i}", "values": [[spread]]})
+        val_it = metrics_it or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
+        val_en = metrics_en or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
 
-    # Scrittura in batch su Google Sheets per massima efficienza
-    if updates:
-        ws_osservazione.batch_update(updates)
-        print(f"✅ Foglio Osservazione aggiornato con {len(updates)} range di celle.")
+        spread = round(metrics_en["vwap"] - metrics_it["vwap"], 2) if metrics_it and metrics_en else "N/A"
+
+        rows_to_append.append([
+            date_only, nome_prodotto, blueprint_id,
+            val_it["lowest_price"], val_it["vwap"], val_it["volatility"], val_it["depth"], val_it["lowest_seller"],
+            val_en["lowest_price"], val_en["vwap"], val_en["volatility"], val_en["depth"], val_en["lowest_seller"],
+            spread
+        ])
+
+    if rows_to_append:
+        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
+        ws_log.append_rows(rows_to_append)
+        print("✅ Storico Osservazione ITA/ENG aggiornato.")
+
+
+def process_osservazione_asiatica(ws_target, ws_log, date_only, language_code, section_name):
+    print(f"\n--- OSSERVAZIONE ({section_name} - NM/MINT) ---")
+    rows = ws_target.get_all_values()
+    condizioni_top = ["Near Mint", "Mint"]
+    rows_to_append = []
+
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+
+        nome_prodotto = row[0]
+        blueprint_id = row[1].strip()
+
+        if not blueprint_id:
+            continue
+
+        print(f"🎯 Target {section_name}: {nome_prodotto} (ID: {blueprint_id})...")
+        
+        metrics = analyze_order_book(blueprint_id, language_code, target_conditions=condizioni_top)
+        time.sleep(1.2)
+
+        val = metrics or {"lowest_price": "N/A", "vwap": "N/A", "volatility": "N/A", "depth": "N/A", "lowest_seller": "N/A"}
+
+        rows_to_append.append([
+            date_only, nome_prodotto, blueprint_id,
+            val["lowest_price"], val["vwap"], val["volatility"], val["depth"], val["lowest_seller"]
+        ])
+
+    if rows_to_append:
+        rows_to_append.append([]) # Inserisce la riga vuota di separazione giornaliera
+        ws_log.append_rows(rows_to_append)
+        print(f"✅ Storico Osservazione {section_name} aggiornato.")
 
 
 def update_system():
-    ws_portfolio, ws_storico, ws_osservazione = setup_google_sheets()
+    # Setup connessione a Google Sheets
+    sheets = setup_google_sheets()
     
     timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     date_only = datetime.now().strftime("%Y-%m-%d")
 
-    process_portfolio(ws_portfolio, ws_storico, date_only, timestamp_now)
-    process_osservazione(ws_osservazione)
+    # 1. Processo Portfolio -> Aggiorna Portfolio e salva in Storico
+    process_portfolio(sheets[0], sheets[1], date_only, timestamp_now)
+    
+    # 2. Processo Osservazione ITA/ENG
+    process_osservazione_it_en(sheets[2], sheets[3], date_only)
+    
+    # 3. Processo Osservazione Giapponese (jp)
+    process_osservazione_asiatica(sheets[4], sheets[5], date_only, "jp", "JAP")
+    
+    # 4. Processo Osservazione Cinese Semplificato (cn)
+    process_osservazione_asiatica(sheets[6], sheets[7], date_only, "cn", "CHI")
 
-    print("\n✅ Elaborazione globale completata!")
+    print("\n🚀 Elaborazione e storicizzazione globale completate con successo!")
+
 
 if __name__ == "__main__":
-    print("🚀 Avvio Pokemon Market Intelligence...")
+    print("Avvio Pokemon Market Intelligence...")
     update_system()
