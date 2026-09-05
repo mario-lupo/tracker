@@ -25,7 +25,7 @@ def setup_google_sheets():
     )
     client = gspread.authorize(creds)
     spreadsheet = client.open(SPREADSHEET_NAME)
-    return spreadsheet.worksheet("Portfolio"), spreadsheet.worksheet("Storico"), spreadsheet.worksheet("Osservazione")
+    return spreadsheet.worksheet("Portfolio"), spreadsheet.worksheet("Storico"), spreadsheet.worksheet("Carte in osservazione")
 
 
 def analyze_order_book(blueprint_id, language, target_conditions=None):
