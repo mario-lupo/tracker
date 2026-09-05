@@ -1,26 +1,27 @@
-name: Pokemon Portfolio Tracker
+name: Aggiornamento Portfolio Pokemon
 
 on:
   schedule:
-    # Esegue ogni giorno alle 03:00 UTC (04:00 o 05:00 in Italia a seconda dell'ora legale)
     - cron: '0 3 * * *'
-  workflow_dispatch: # Ti permette di avviarlo anche manualmente con un click
+  workflow_dispatch:
 
 jobs:
   run-tracker:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-
+        uses: actions/checkout@v4
+        
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
+          python-version: '3.11'
+          
       - name: Installa dipendenze
-        run: pip install -r requirements.txt
-
+        run: |
+          pip install -r requirements.txt
+          
       - name: Esegui lo script
         env:
           CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
