@@ -1,14 +1,15 @@
 import math
 import time
 from datetime import datetime
-
+import os
+import json
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
 # --- CONFIGURAZIONE ---
-CARDTRADER_TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJjYXJkdHJhZGVyLXByb2R1Y3Rpb24iLCJzdWIiOiJhcHA6MjM5MTIiLCJhdWQiOiJhcHA6MjM5MTIiLCJleHAiOjQ5NDIzMzU3MjMsImp0aSI6ImRhYjQ2NWM3LWNkOTYtNDQ2OC1iOGQ3LTEwZjc4ZGMzNWFlOSIsImlhdCI6MTc4NjY1ODUyMywibmFtZSI6Ik0gbHVwbzE5OTUgQXBwIDIwMjYwODEzMjA0NDA5In0.O5i1bU-hAb1nrLPaW_KYtjsCuVtIpxLuDsQyVM-19IlG1Y8DtYkd8-HxDiSbLF_rdu8fJfBWoRLVa4Ttekg01QgbEa1t1KpTqG4VSJgz2-nMvDMXtIAn4VawWpjnG6Ony2SWngmIzjqyOo5zGFz0kgpCuxWoNhydvhfryzPeMQDbdNmbhrJInPiQvCTaYMUIHHweuhtipUi5ZfhAYGMlki9pi6l6YRSjo68cmx3SYIKTV43RbFfdyIVT6oj09nktKg-HXpbYwNbruINOrOkjOIypOM_cTftgKZtxYsIQHz2OhtnOmu7i_szKUFiJUsft6ELButjl8ivQ-Rubkv6SEw"
-GOOGLE_SHEETS_JSON = "credentials.json"
+CARDTRADER_TOKEN = os.environ.get("CARDTRADER_TOKEN")
+creds_dict = json.loads(os.environ.get("GCP_CREDENTIALS"))
 SPREADSHEET_NAME = "Pokemon_Tracker"
 BASE_URL = "https://api.cardtrader.com/api/v2"
 CT_HEADERS = {"Authorization": f"Bearer {CARDTRADER_TOKEN}"}
