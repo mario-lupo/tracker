@@ -36,7 +36,9 @@ def setup_google_sheets():
         spreadsheet.worksheet("Target JAP"),
         spreadsheet.worksheet("Carte in osservazione JAP"),
         spreadsheet.worksheet("Target CHI"),
-        spreadsheet.worksheet("Carte in osservazione CHI")
+        spreadsheet.worksheet("Carte in osservazione CHI"),
+        spreadsheet.worksheet("30esimo target"),
+        spreadsheet.worksheet("In osservazione 30esimo")
     )
 
 
@@ -391,6 +393,9 @@ def update_system():
     
     # 4. Processo Osservazione Cinese (cn)
     process_osservazione_asiatica(sheets[6], sheets[7], date_only, "cn", "CHI", session)
+
+    # 5. Processo Osservazione 30esimo Anniversario (ITA/ENG)
+    process_osservazione_it_en(sheets[8], sheets[9], date_only, session)
 
     print("\n🚀 Elaborazione e storicizzazione globale completate con successo!")
 
